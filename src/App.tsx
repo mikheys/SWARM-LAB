@@ -291,22 +291,21 @@ class Simulation {
     return base * vert * p.sizeMul;
   }
 
-  // жёсткая граница: центр рыбки НИКОГДА не заходит за контактную зону.
-  // После выброса обнуляем нормальную скорость — чтобы коллизии сзади
-  // не толкали её внутрь в том же кадре и не создавали осцилляцию.
+  // простой барьер: выталкиваем на contact + small buffer, гасим скорость.
+  // Один вызов после коллизий — без двойного дёрганья.
   clampZone(p) {
     const s = this.sampleField(p.x, p.y);
     if (!s) return;
-    const contact = Math.max(4, this.cfg.object.gap + p.size);
+    const contact = Math.max(4, this.cfg.object.gap + p.size + 2);
     if (s.d < contact) {
-      const targetDist = contact + 2;
-      const pen = targetDist - s.d;
+      const pen = contact - s.d;
       p.x += s.gx * pen;
       p.y += s.gy * pen;
-      // обнуляем скорость по нормали — без выплёвывания
       const vn = p.vx * s.gx + p.vy * s.gy;
-      p.vx -= s.gx * vn;
-      p.vy -= s.gy * vn;
+      if (vn < 0) {
+        p.vx -= s.gx * vn;
+        p.vy -= s.gy * vn;
+      }
     }
   }
 
@@ -476,9 +475,8 @@ class Simulation {
       let faceX = 0,
         faceY = -1;
       if (s) {
-        const contact = gap + p.size;
         const maxV = ph.maxSpeed * p.eager; // «жадные» едут быстрее
-        let ts = maxV * clamp((s.d - contact) / ph.slowR, 0, 1);
+        let ts = maxV * clamp((s.d - gap - p.size) / ph.slowR, 0, 1);
         // если впереди кто-то есть — почти перестаём толкать внутрь
         // (пропускаем во время «пробуждения» — когда объект двигают)
         let blocked = false;
@@ -494,7 +492,7 @@ class Simulation {
         }
         if (blocked) ts *= ph.seekBlocked;
         // если рыбка уже уткнулась в границу — задние не продавят её сильнее
-        if (s.d < contact + ph.slowR * 0.05) ts *= 0.2;
+        if (s.d < gap + p.size + ph.slowR * 0.05) ts *= 0.2;
         ax += (-s.gx * ts - p.vx) * ph.steer;
         ay += (-s.gy * ts - p.vy) * ph.steer;
         // когерентная волна по полю: соседи колышутся вместе (плавно, не дёргано)
@@ -552,7 +550,6 @@ class Simulation {
       }
       p.x += p.vx * dt;
       p.y += p.vy * dt;
-      this.clampZone(p); // жёсткий барьер: не пускаем в зону на скорости
 
       // спячка: микровибрации < порога гасим полностью — убивает дрыгание коллизий
       let speed = Math.hypot(p.vx, p.vy);
@@ -564,17 +561,17 @@ class Simulation {
         p.vy *= damp;
         speed = Math.hypot(p.vx, p.vy);
       }
-      // спячка: гистерезис — уснуть легче, проснуться труднее
-      // убирает микроосцилляции на границе когда скорость скачет туда-сюда
-      if (!p._sleeping && speed < ph.sleepThreshold) {
-        p._sleeping = true;
+      if (speed < ph.sleepThreshold) {
         p.vx = 0;
         p.vy = 0;
-      } else if (p._sleeping && speed > ph.sleepThreshold * 2.5) {
-        p._sleeping = false;
-      } else if (p._sleeping) {
-        p.vx = 0;
-        p.vy = 0;
+      }
+
+      // трение вдоль границы: рыбки у бутылки не скользят вверх-вниз
+      if (s && !isAwake && s.d < gap + p.size + ph.slowR * 0.15) {
+        const tx = -s.gy, ty = s.gx;
+        const vt = p.vx * tx + p.vy * ty;
+        p.vx -= tx * vt * 0.9;
+        p.vy -= ty * vt * 0.9;
       }
 
       // анти-давка: если кто-то толкает рыбку внутрь объекта а она уже у края — демпфируем
@@ -632,13 +629,13 @@ class Simulation {
           const minD = (rp + rq) * pc.packing * packMul;
           if (dist < minD) {
             const overlap = minD - dist;
-            // симметрично разводим ОБЕ частицы (центр масс пары не смещается)
+            // симметрично разводим обе частицы
             const corr = overlap * 0.5 * push * packMul;
             p.x += nx * corr;
             p.y += ny * corr;
             q.x -= nx * corr;
             q.y -= ny * corr;
-            // отклик по скорости: гасим сближение, симметрично для обеих
+            // отклик по скорости: гасим сближение
             const rvn = (p.vx - q.vx) * nx + (p.vy - q.vy) * ny;
             if (rvn < 0) {
               const j = -rvn * (1 + rest) * 0.5;
@@ -652,27 +649,8 @@ class Simulation {
       }
     }
 
-    // финальный кламп для всех — без обнуления скорости.
-    // Спящие не накопят скорость (v=0), но позиция корректируется.
-    // Для не-спящих — полный clampZone со скоростью.
-    for (let i = 0; i < parts.length; i++) {
-      const p = parts[i];
-      const s = this.sampleField(p.x, p.y);
-      if (!s) continue;
-      const contact = Math.max(4, this.cfg.object.gap + p.size);
-      if (s.d < contact) {
-        const targetDist = contact + 2;
-        const pen = targetDist - s.d;
-        p.x += s.gx * pen;
-        p.y += s.gy * pen;
-        if (!p._sleeping) {
-          // только активным — гасим нормальную скорость
-          const vn = p.vx * s.gx + p.vy * s.gy;
-          p.vx -= s.gx * vn;
-          p.vy -= s.gy * vn;
-        }
-      }
-    }
+    // финальный кламп: коллизии могли затолкать в зону — выталкиваем
+    for (let i = 0; i < parts.length; i++) this.clampZone(parts[i]);
 
     // --- 3. удаление улетевших далеко за край (край не стенка) ---
     const M = ph.cullMargin;
