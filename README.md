@@ -1,73 +1,93 @@
-# React + TypeScript + Vite
+# SwarmLab — Particle Swarm Around Shape Editor
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Интерактивное веб-приложение для симуляции роя частиц, обтекающих произвольный силуэт. Частицы (агенты) динамически упаковываются вокруг загруженной маски, создавая органичное движение.
 
-Currently, two official plugins are available:
+## Возможности
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- **Загрузка маски** — SVG или PNG силуэт (бутылка, человек, логотип, животное)
+- **Загрузка визуала** — независимое изображение поверх маски (текст, лого, иллюстрация)
+- **Загрузка агентов** — пользовательские спрайты (глаза, рыбы, стрелки, иконки)
+- **Рой частиц** — тысячи агентов, обтекающих силуэт с коллизиями
+- **SDF граница** — Signed Distance Field для точного определения края маски
+- **Физика** — steering, коллизии (spatial hash grid), инерция, трение, упругость
+- **Масштабирование** — по Y-позиции, возрасту, дистанции
+- **Волны** — когерентные колебания роя
+- **Управление** — spawn кистью, drag объекта, встряска, push режим
+- **Сцена** — save/load в JSON, запись видео, скриншот 4K
+- **Настройка** — 40+ параметров через Tweakpane-подобную панель
 
-## React Compiler
+## Технологии
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+| Компонент | Технология |
+|-----------|-----------|
+| Фреймворк | React 19 + TypeScript |
+| Бандлер | Vite |
+| Рендер | Canvas 2D (PixiJS-ready архитектура) |
+| Состояние | Zustand-like (inline store) |
+| SDF | Felzenszwalb & Huttenlocher EDT |
+| Коллизии | Spatial Hash Grid (O(n)) |
+| Физика | Самописный движок (steering + коллизии) |
 
-## Expanding the ESLint configuration
+## Быстрый старт
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Приложение будет доступно на `http://localhost:5173`.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Использование
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+1. **Загрузите маску** — нажмите «Маска» и выберите SVG или PNG силуэт
+2. **Загрузите визуал** — нажмите «Изображение» для отображения внутри маски
+3. **Загрузите агентов** — нажмите «Агент» для кастомных спрайтов
+4. **Спавн** — зажмите левую кнопку мыши на холсте для непрерывной генерации
+5. **Drag** — перетаскивайте объект для смещения роя
+6. **Настройка** — левая панель: spawn, размеры, физика, волны
+
+## Архитектура
+
 ```
+src/
+├── main.tsx           — точка входа
+├── App.tsx            — весь код приложения (артефакт)
+│
+│   Компоненты:
+│   ├── DistanceField  — SDF из бинарной маски
+│   ├── SpatialHash    — Broad-phase коллизий
+│   ├── Particle       — Состояние агента
+│   ├── Simulation     — Основной цикл (forces → collisions → clamp)
+│   └── Renderer       — Canvas 2D отрисовка
+│
+│   UI:
+│   ├── ConfigToolbar  — Левая панель параметров
+│   ├── RightPanel     — Правая панель
+│   └── Slider         — Компонент с desc/i/inline edit
+```
+
+## Параметры
+
+### Canvas
+Ширина, высота, фон
+
+### Spawn
+Per emit, brush radius, max particles, burst count
+
+### Объект
+Gap, show mask/visual, face mode (center/inner), inner scale
+
+### Частицы
+- Размер: spawn, base, grow time, top/bottom scale, случайный разброс
+- Поворот к краю, плавность поворота, packing, width ratio
+- Палитра, вариации, процедурная генерация
+
+### Физика
+Friction, steer, slow radius, max speed, seek blocked, collision iters/push, restitution, sleep threshold, cull margin, eager fraction/boost
+
+### Волны
+Амплитуда, длина, скорость
+
+## Лицензия
+
+MIT
