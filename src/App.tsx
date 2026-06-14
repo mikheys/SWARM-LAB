@@ -1019,7 +1019,7 @@ class Renderer {
     this.objSprite = c;
   }
 
-  draw(ctx, sim, maskCanvas, cfg, mode) {
+  draw(ctx, sim, maskCanvas, cfg, mode, skipParticles) {
     const { canvas } = cfg;
     ctx.fillStyle = canvas.bg;
     ctx.fillRect(0, 0, canvas.w, canvas.h);
@@ -1044,7 +1044,7 @@ class Renderer {
     const foff = proc ? 0 : this.frontOffset;
     const wr = cfg.particle.widthRatio;
     const pathMode = proc && shape !== "eye"; // формы кроме глаза рисуем путём
-    if (pathMode || sprite) {
+    if (!skipParticles && (pathMode || sprite)) {
       const sw = sprite ? sprite.width : 0;
       const sh = sprite ? sprite.height : 0;
       for (let i = 0; i < sim.particles.length; i++) {
@@ -1091,6 +1091,207 @@ class Renderer {
       ctx.restore();
     }
 
+  }
+}
+
+/* ============== WebGL-рендер частиц (бэкенд «WebGL/GPU») =============== */
+// Формы пекутся в текстуры (тем же drawProcShape, что Canvas2D — без расхождений),
+// частицы рисуются инстансингом: один draw-call на «слой». Per-instance:
+// позиция, угол, полу-размеры, локальный сдвиг (для зрачка), цвет.
+function bakeMaskTex(shape, proc, S = 512) {
+  const c = document.createElement("canvas"); c.width = S; c.height = S;
+  const ctx = c.getContext("2d");
+  ctx.translate(S / 2, S / 2);
+  Renderer.prototype.drawProcShape(ctx, shape, S * 0.46, S * 0.46, "#ffffff", proc);
+  return c;
+}
+function bakeEyeBodyTex(point, S = 512) {
+  const c = document.createElement("canvas"); c.width = S; c.height = S;
+  const ctx = c.getContext("2d");
+  ctx.translate(S / 2, S / 2);
+  const L = S * 0.46;
+  const cp = lerp(0.46, 0.06, clamp(point, 0, 1));
+  ctx.beginPath();
+  ctx.moveTo(-L, 0);
+  ctx.bezierCurveTo(-L + 2 * L * cp, -L, L - 2 * L * cp, -L, L, 0);
+  ctx.bezierCurveTo(L - 2 * L * cp, L, -L + 2 * L * cp, L, -L, 0);
+  ctx.closePath();
+  ctx.fillStyle = "#f6f4ef"; ctx.fill();
+  ctx.lineWidth = Math.max(2, L * 0.04); ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.stroke();
+  return c;
+}
+function bakeDiskTex(S = 256) {
+  const c = document.createElement("canvas"); c.width = S; c.height = S;
+  const ctx = c.getContext("2d");
+  ctx.beginPath(); ctx.arc(S / 2, S / 2, S * 0.46, 0, TAU); ctx.fillStyle = "#fff"; ctx.fill();
+  return c;
+}
+// формы запекаются с полем 0.46 ячейки → видимый полу-размер = 0.92×квадрата.
+// компенсируем, чтобы WebGL совпадал с Canvas2D по размеру.
+const GL_FILL_K = 0.5 / 0.46;
+
+const GL_VS = `#version 300 es
+layout(location=0) in vec2 a_quad;
+layout(location=1) in vec2 a_pos;
+layout(location=2) in float a_rot;
+layout(location=3) in vec2 a_half;
+layout(location=4) in vec2 a_local;
+layout(location=5) in vec3 a_color;
+uniform vec2 u_res;
+out vec2 v_uv;
+out vec3 v_color;
+void main(){
+  vec2 corner = a_local + a_quad * 2.0 * a_half;
+  float c = cos(a_rot), s = sin(a_rot);
+  vec2 r = vec2(corner.x*c - corner.y*s, corner.x*s + corner.y*c);
+  vec2 world = a_pos + r;
+  vec2 ndc = world / u_res * 2.0 - 1.0;
+  gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
+  v_uv = a_quad + 0.5;
+  v_color = a_color;
+}`;
+const GL_FS = `#version 300 es
+precision mediump float;
+in vec2 v_uv;
+in vec3 v_color;
+uniform sampler2D u_tex;
+uniform float u_tint;
+out vec4 frag;
+void main(){
+  vec4 t = texture(u_tex, v_uv);
+  frag = (u_tint > 0.5) ? vec4(v_color, t.a) : t;
+}`;
+
+class WebGLParticleRenderer {
+  constructor(canvas) {
+    const gl = canvas.getContext("webgl2", { alpha: true, premultipliedAlpha: false, antialias: true });
+    if (!gl) throw new Error("WebGL2 недоступен");
+    this.gl = gl; this.canvas = canvas;
+    this.prog = this._program(GL_VS, GL_FS);
+    this.u_res = gl.getUniformLocation(this.prog, "u_res");
+    this.u_tex = gl.getUniformLocation(this.prog, "u_tex");
+    this.u_tint = gl.getUniformLocation(this.prog, "u_tint");
+    this.vao = gl.createVertexArray();
+    gl.bindVertexArray(this.vao);
+    const quad = new Float32Array([-0.5,-0.5, 0.5,-0.5, 0.5,0.5, -0.5,-0.5, 0.5,0.5, -0.5,0.5]);
+    this.quadBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    this.instBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.instBuf);
+    const stride = 10 * 4;
+    const set = (loc, size, off) => { gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, stride, off); gl.vertexAttribDivisor(loc, 1); };
+    set(1, 2, 0); set(2, 1, 8); set(3, 2, 12); set(4, 2, 20); set(5, 3, 28);
+    gl.bindVertexArray(null);
+    this.instData = new Float32Array(0);
+    this._rgbCache = new Map();
+    this.maskTex = null; this.eyeTex = null; this.imgTex = null;
+    this.diskTex = this._tex(bakeDiskTex());
+    this.procedural = true; this.shape = "eye";
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  }
+  _compile(type, src) {
+    const gl = this.gl, s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) || "shader");
+    return s;
+  }
+  _program(vs, fs) {
+    const gl = this.gl, p = gl.createProgram();
+    gl.attachShader(p, this._compile(gl.VERTEX_SHADER, vs));
+    gl.attachShader(p, this._compile(gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) || "link");
+    return p;
+  }
+  _tex(srcCanvas) {
+    const gl = this.gl, t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, srcCanvas);
+    gl.generateMipmap(gl.TEXTURE_2D); // трилинейная фильтрация — убирает шиммер при уменьшении
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const aniso = this._aniso || (this._aniso = gl.getExtension("EXT_texture_filter_anisotropic"));
+    if (aniso) gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT,
+      Math.min(8, gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+    return t;
+  }
+  // пересобрать текстуры из состояния Renderer + cfg (форма/спрайт/параметры)
+  sync(rend, cfg) {
+    const gl = this.gl;
+    this.procedural = rend.useProcedural;
+    this.shape = rend.procShape;
+    if (!rend.useProcedural) {
+      if (this.imgTex) gl.deleteTexture(this.imgTex);
+      this.imgTex = rend.bodySprite ? this._tex(rend.bodySprite) : null;
+    } else if (rend.procShape === "eye") {
+      if (this.eyeTex) gl.deleteTexture(this.eyeTex);
+      this.eyeTex = this._tex(bakeEyeBodyTex(cfg.proc.point));
+    } else {
+      if (this.maskTex) gl.deleteTexture(this.maskTex);
+      this.maskTex = this._tex(bakeMaskTex(rend.procShape, cfg.proc));
+    }
+  }
+  _hex(hex) {
+    let v = this._rgbCache.get(hex);
+    if (!v) {
+      const h = (hex || "#fff").replace("#", "");
+      const n = parseInt(h.length === 3 ? h.split("").map(x => x + x).join("") : h, 16) || 0;
+      v = [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+      this._rgbCache.set(hex, v);
+    }
+    return v;
+  }
+  _layer(parts, tex, tint, fn) {
+    const gl = this.gl, n = parts.length, need = n * 10;
+    if (this.instData.length < need) this.instData = new Float32Array(need);
+    const d = this.instData, o = { hw: 0, hh: 0, lx: 0, ly: 0, r: 1, g: 1, b: 1 };
+    for (let i = 0; i < n; i++) {
+      const p = parts[i]; fn(p, o); const b = i * 10;
+      d[b] = p.x; d[b+1] = p.y; d[b+2] = p.angle; d[b+3] = o.hw; d[b+4] = o.hh;
+      d[b+5] = o.lx; d[b+6] = o.ly; d[b+7] = o.r; d[b+8] = o.g; d[b+9] = o.b;
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.instBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, d.subarray(0, need), gl.DYNAMIC_DRAW);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.uniform1i(this.u_tex, 0); gl.uniform1f(this.u_tint, tint);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, n);
+  }
+  render(sim, cfg) {
+    const gl = this.gl, W = cfg.canvas.w, H = cfg.canvas.h;
+    // буфер кадра в нативном разрешении экрана (суперсэмплинг) — частицы резче,
+    // координаты мира (u_res) остаются W×H, поэтому позиции не меняются.
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const cw = this.canvas.clientWidth || W, ch = this.canvas.clientHeight || H;
+    const bw = Math.max(1, Math.round(cw * dpr)), bh = Math.max(1, Math.round(ch * dpr));
+    if (this.canvas.width !== bw || this.canvas.height !== bh) { this.canvas.width = bw; this.canvas.height = bh; }
+    gl.viewport(0, 0, bw, bh);
+    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    const parts = sim.particles, n = parts.length;
+    if (!n) return;
+    gl.useProgram(this.prog);
+    gl.bindVertexArray(this.vao);
+    gl.uniform2f(this.u_res, W, H);
+    const wr = cfg.particle.widthRatio, K = GL_FILL_K;
+    if (!this.procedural && this.imgTex) {
+      this._layer(parts, this.imgTex, 0, (p, o) => { o.hw = p.size * K; o.hh = p.size * wr * K; o.lx = 0; o.ly = 0; });
+    } else if (this.shape === "eye" && this.eyeTex) {
+      const dot = cfg.proc.dot;
+      this._layer(parts, this.eyeTex, 0, (p, o) => { o.hw = p.size * K; o.hh = p.size * wr * K; o.lx = 0; o.ly = 0; o.r = 1; o.g = 1; o.b = 1; });
+      if (dot > 0.001) {
+        this._layer(parts, this.diskTex, 1, (p, o) => { const ir = 2 * wr * dot * p.size; o.hw = ir * K; o.hh = ir * K; o.lx = 0.5 * p.size; o.ly = 0; const c = this._hex(p.dot); o.r = c[0]; o.g = c[1]; o.b = c[2]; });
+        this._layer(parts, this.diskTex, 1, (p, o) => { const ir = 2 * wr * dot * p.size, pr = ir * 0.45; o.hw = pr * K; o.hh = pr * K; o.lx = 0.5 * p.size + 0.55 * ir; o.ly = 0; o.r = 0; o.g = 0; o.b = 0; });
+      }
+    } else if (this.maskTex) {
+      this._layer(parts, this.maskTex, 1, (p, o) => { o.hw = p.size * K; o.hh = p.size * wr * K; o.lx = 0; o.ly = 0; const c = this._hex(p.dot); o.r = c[0]; o.g = c[1]; o.b = c[2]; });
+    }
+    gl.bindVertexArray(null);
   }
 }
 
@@ -1588,6 +1789,8 @@ function FileRow({ label, accept, onFile }) {
 /* ================================ Component ============================= */
 export default function App() {
   const canvasRef = useRef(null);
+  const glCanvasRef = useRef(null); // оверлей-канвас для WebGL-частиц
+  const glRendRef = useRef(null);   // WebGLParticleRenderer (ленивая инициализация)
   const simRef = useRef(null);
   const rendRef = useRef(null);
   const maskRef = useRef(null); // текущий canvas маски
@@ -1604,6 +1807,9 @@ export default function App() {
   const [frontDeg, setFrontDeg] = useState(0);
   const [recording, setRecording] = useState(false);
   const [activePreset, setActivePreset] = useState(null);
+  const [renderMode, setRenderMode] = useState("canvas"); // canvas | webgl
+  const renderModeRef = useRef(renderMode);
+  renderModeRef.current = renderMode;
   const mediaRecRef = useRef(null);
 
   // храним актуальный конфиг в ref, чтобы цикл не пересоздавался
@@ -1653,7 +1859,10 @@ export default function App() {
         lastT.current = t;
         if (!pausedRef.current)
           sim.step(dt, cfgRef.current.canvas.w, cfgRef.current.canvas.h);
-        rend.draw(ctx, sim, maskRef.current, cfgRef.current, modeRef.current);
+        const useGL = renderModeRef.current === "webgl" && glRendRef.current;
+        // в WebGL-режиме 2D рисует только фон+объект, частицы — на GPU-оверлее
+        rend.draw(ctx, sim, maskRef.current, cfgRef.current, modeRef.current, useGL);
+        if (useGL) glRendRef.current.render(sim, cfgRef.current);
         // эмиссия при зажатой мыши в режиме spawn
         if (mouse.current.down && modeRef.current === "spawn")
           sim.spawn(mouse.current.x, mouse.current.y);
@@ -1688,8 +1897,10 @@ export default function App() {
       // рисуются вживую в draw() и не требуют пересборки.
       r.buildProceduralSprite(cfg.proc.shape, cfg.particle.widthRatio, cfg.proc.point, cfg.proc.dot);
     }
+    if (glRendRef.current) glRendRef.current.sync(r, cfg); // обновить GPU-текстуры
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cfg.proc.shape, cfg.particle.widthRatio, cfg.proc.point, cfg.proc.dot]);
+  }, [cfg.proc.shape, cfg.particle.widthRatio, cfg.proc.point, cfg.proc.dot,
+      cfg.proc.round, cfg.proc.notch, cfg.proc.spikes, cfg.proc.depth, cfg.proc.sides, cfg.proc.hole, cfg.proc.tail, cfg.proc.petals]);
 
   /* ------------------------ загрузка файлов ------------------------- */
   const loadImage = (file) =>
@@ -1726,6 +1937,7 @@ export default function App() {
     const img = await loadImage(file);
     rendRef.current.setSpriteImage(img, (frontDeg * Math.PI) / 180);
     set("particle.widthRatio", clamp(img.height / img.width, 0.15, 1));
+    if (glRendRef.current) glRendRef.current.sync(rendRef.current, cfgRef.current);
   };
 
   // применить пресет-«характер»: конфиг + маска + форма частицы + заполнение
@@ -1747,7 +1959,28 @@ export default function App() {
     sim.obj.rot = 0;
     sim.clear();
     sim.fillCanvas(c.canvas.w, c.canvas.h); // мгновенный результат
+    if (glRendRef.current) glRendRef.current.sync(rend, c);
     setActivePreset(preset.key);
+  };
+
+  // переключение бэкенда рендера; WebGL инициализируется лениво, с фолбэком
+  const setRenderBackend = (m) => {
+    if (m === "webgl") {
+      if (!glRendRef.current) {
+        try {
+          glRendRef.current = new WebGLParticleRenderer(glCanvasRef.current);
+          glRendRef.current.sync(rendRef.current, cfgRef.current);
+        } catch (e) {
+          console.warn("WebGL недоступен, остаёмся на Canvas 2D:", e);
+          glRendRef.current = null;
+          setRenderMode("canvas");
+          return;
+        }
+      } else {
+        glRendRef.current.sync(rendRef.current, cfgRef.current);
+      }
+    }
+    setRenderMode(m);
   };
 
   // обновление front offset для загруженного спрайта
@@ -1928,6 +2161,7 @@ export default function App() {
               set("proc.shape", "eye");
               set("particle.widthRatio", SHAPE_WR.eye);
               rendRef.current.buildProceduralSprite("eye", SHAPE_WR.eye, pp.point, pp.dot);
+              if (glRendRef.current) glRendRef.current.sync(rendRef.current, cfgRef.current);
             }}
             className="w-full text-[11px] px-2 py-1.5 rounded bg-neutral-800 hover:bg-neutral-700 mt-1"
           >
@@ -2077,17 +2311,26 @@ export default function App() {
           <span className="tabular-nums w-[7ch] text-right">{String(count).padStart(5, "\u00a0")} объектов</span>
           <span className="tabular-nums w-[5ch] text-right">{String(fps).padStart(3, "\u00a0")} fps</span>
         </div>
-        <canvas
-          ref={canvasRef}
-          width={cfg.canvas.w}
-          height={cfg.canvas.h}
-          onMouseDown={onDown}
-          onMouseMove={onMove}
-          onMouseUp={onUp}
-          onMouseLeave={() => { onUp(); if (simRef.current) simRef.current.pointer.inside = false; }}
-          className="rounded-lg shadow-2xl cursor-crosshair max-w-full max-h-[80vh] border border-neutral-700"
-          style={{ touchAction: "none", cursor: mode === "erase" ? "cell" : mode === "move" ? "grab" : mode === "push" ? "move" : "crosshair" }}
-        />
+        <div className="relative inline-block">
+          <canvas
+            ref={canvasRef}
+            width={cfg.canvas.w}
+            height={cfg.canvas.h}
+            onMouseDown={onDown}
+            onMouseMove={onMove}
+            onMouseUp={onUp}
+            onMouseLeave={() => { onUp(); if (simRef.current) simRef.current.pointer.inside = false; }}
+            className="block rounded-lg shadow-2xl cursor-crosshair max-w-full max-h-[80vh] border border-neutral-700"
+            style={{ touchAction: "none", cursor: mode === "erase" ? "cell" : mode === "move" ? "grab" : mode === "push" ? "move" : "crosshair" }}
+          />
+          {/* WebGL-оверлей частиц: ровно над 2D-канвасом, события мыши не перехватывает.
+              Размер буфера задаёт сам рендер (нативное разрешение экрана). */}
+          <canvas
+            ref={glCanvasRef}
+            className="absolute inset-0 w-full h-full rounded-lg pointer-events-none"
+            style={{ display: renderMode === "webgl" ? "block" : "none" }}
+          />
+        </div>
         <div className="mt-3 flex gap-2 text-xs">
           <button
             onClick={() => setMode("spawn")}
@@ -2184,6 +2427,17 @@ export default function App() {
           </div>
           <p className="text-[10px] text-neutral-500 leading-relaxed mt-2">
             «Скорость» строит сетку коллизий и решает границу 1 раз за кадр (вместо ×проходов) и чуть снижает число проходов — заметный прирост FPS при большом числе частиц ценой лёгкой рыхлости фронта. «Авто» включает это при &gt;1400 частиц.
+          </p>
+          <div className="text-[11px] text-neutral-400 mb-1 mt-3">Рендер частиц</div>
+          <div className="flex gap-1">
+            {([["canvas","Canvas 2D"],["webgl","WebGL (GPU)"]]).map(([m, lbl]) => (
+              <button key={m} onClick={() => setRenderBackend(m)}
+                className={`text-[10px] px-2 py-1.5 rounded flex-1 ${renderMode === m ? "bg-amber-500 text-black" : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"}`}
+              >{lbl}</button>
+            ))}
+          </div>
+          <p className="text-[10px] text-neutral-500 leading-relaxed mt-2">
+            WebGL рисует все частицы инстансингом на видеокарте (один draw-call на слой) — снимает потолок по отрисовке. Физика остаётся на CPU (её ускоряет режим «Скорость»). Если WebGL2 недоступен — авто-возврат на Canvas 2D.
           </p>
         </Section>
 
