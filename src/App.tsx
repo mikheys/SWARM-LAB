@@ -213,6 +213,7 @@ class Simulation {
     this.hash = new SpatialHash(40);
     this.time = 0; // для когерентной волны по полю
     this._wakeTimer = 0; // время «пробуждения» после движения объекта
+    this.pointer = { x: 0, y: 0, inside: false }; // курсор в мире (для «хищника»)
   }
 
   setField(field) {
@@ -291,9 +292,11 @@ class Simulation {
     return base * vert * p.sizeMul;
   }
 
-  // простой барьер: выталкиваем на contact + small buffer, гасим скорость.
-  // Один вызов после коллизий — без двойного дёрганья.
-  clampZone(p) {
+  // граница объекта как жёсткая стенка: если рыбка зашла в зону — выталкиваем
+  // ТОЛЬКО позицию (скорость восстановим из перемещения, см. step §3).
+  // Решается ВНУТРИ цикла ограничений рядом с коллизиями — поэтому давление
+  // переднего ряда расходится по касательной, а не отлетает рывком назад.
+  solveWall(p) {
     const s = this.sampleField(p.x, p.y);
     if (!s) return;
     const contact = Math.max(4, this.cfg.object.gap + p.size + 2);
@@ -301,11 +304,6 @@ class Simulation {
       const pen = contact - s.d;
       p.x += s.gx * pen;
       p.y += s.gy * pen;
-      const vn = p.vx * s.gx + p.vy * s.gy;
-      if (vn < 0) {
-        p.vx -= s.gx * vn;
-        p.vy -= s.gy * vn;
-      }
     }
   }
 
@@ -447,6 +445,11 @@ class Simulation {
     // затухание встряски
     if (this._shakeRepel) this._shakeRepel = Math.max(0, this._shakeRepel - dt * 0.6);
     const wv = c.wave;
+    const bh = c.behaviors || {}; // подключаемые режимы поведения
+    // режим производительности: «speed» режет повторные перестройки сетки и
+    // решение границы до 1 раза за кадр (вместо ×iters) — основная экономия CPU.
+    const perf = c.perf || { mode: "quality" };
+    const speedMode = perf.mode === "speed" || (perf.mode === "auto" && parts.length > 1400);
 
     // детекция движения объекта: если двигаем — «пробуждаем» рой на 0.5с
     const objDx = this.obj.x - (this.obj._px || this.obj.x);
@@ -454,6 +457,8 @@ class Simulation {
     this.obj._px = this.obj.x;
     this.obj._py = this.obj.y;
     const objSpeed = Math.hypot(objDx, objDy) / Math.max(dt, 0.001);
+    const objVx = objDx / Math.max(dt, 0.001);
+    const objVy = objDy / Math.max(dt, 0.001);
     if (objSpeed > 5) this._wakeTimer = 0.5;
     else this._wakeTimer = Math.max(0, this._wakeTimer - dt);
     const isAwake = this._wakeTimer > 0;
@@ -466,33 +471,65 @@ class Simulation {
     }
     this.rebuildHash(pc); // для проверки «впереди занято» в цикле сил
 
-    // --- 1. силы поля + интегрирование + ориентация ---
+    // --- 1. силы поля → желаемая скорость → предсказание позиции + ориентация ---
+    //     Здесь только «намерение» рыбки: куда она хочет плыть. Реальную позицию
+    //     допилит решатель ограничений (§2), а скорость восстановим из неё (§3).
     for (let i = 0; i < parts.length; i++) {
       const p = parts[i];
+      // позиция в начале кадра — из неё восстановим скорость после ограничений
+      p.px0 = p.x;
+      p.py0 = p.y;
       let ax = 0,
         ay = 0;
       const s = this.sampleField(p.x, p.y);
       let faceX = 0,
         faceY = -1;
+
+      // --- соседи: ОДИН проход для blocked + стайности + плотности + мембраны ---
+      let blocked = false;
+      let alignX = 0, alignY = 0, cohX = 0, cohY = 0, nCount = 0;
+      const needFlock = (bh.flock && bh.flock.on) || (bh.density && bh.density.on);
+      const memOn = bh.membrane && bh.membrane.on;
+      if (s || needFlock || memOn) {
+        const pr = p.size;
+        const fr = bh.flock ? bh.flock.radius : 70;
+        const mr = bh.membrane ? bh.membrane.radius : 0;
+        this.forEachNeighborFar(p, (q) => {
+          const dx = q.x - p.x, dy = q.y - p.y;
+          const d = Math.hypot(dx, dy) || 1;
+          if (s && !isAwake && !blocked) {
+            const dot = (dx / d) * -s.gx + (dy / d) * -s.gy;
+            if (dot > 0.5 && d < (pr + q.size) * ph.blockDist) blocked = true;
+          }
+          if (needFlock && d < fr) {
+            alignX += q.vx; alignY += q.vy;
+            cohX += q.x; cohY += q.y;
+            nCount++;
+          }
+          // [membrane] демпфированная пружина к соседям: притяжение ТОЛЬКО за
+          // контактом (близких разводят коллизии). Гашение по оси связи убирает
+          // хаос — рой держится как тянущаяся плёнка, а не схлопывается.
+          if (memOn && d < mr) {
+            const rest = (pr + q.size) * pc.packing;
+            if (d > rest) {
+              const ux = dx / d, uy = dy / d;
+              const f = (d - rest) * bh.membrane.stiffness * 18;
+              const rvn = (q.vx - p.vx) * ux + (q.vy - p.vy) * uy; // сближение<0
+              const damp = rvn * bh.membrane.stiffness * 6;
+              ax += ux * (f + damp);
+              ay += uy * (f + damp);
+            }
+          }
+        });
+      }
+
       if (s) {
         const maxV = ph.maxSpeed * p.eager; // «жадные» едут быстрее
         let ts = maxV * clamp((s.d - gap - p.size) / ph.slowR, 0, 1);
-        // если впереди кто-то есть — почти перестаём толкать внутрь
-        // (пропускаем во время «пробуждения» — когда объект двигают)
-        let blocked = false;
-        if (!isAwake) {
-          const pr = p.size;
-          this.forEachNeighborFar(p, (q) => {
-            if (blocked) return;
-            const dx = q.x - p.x, dy = q.y - p.y;
-            const d = Math.hypot(dx, dy) || 1;
-            const dot = (dx / d) * -s.gx + (dy / d) * -s.gy;
-            if (dot > 0.5 && d < (pr + q.size) * ph.blockDist) blocked = true;
-          });
-        }
         if (blocked) ts *= ph.seekBlocked;
-        // если рыбка уже уткнулась в границу — задние не продавят её сильнее
-        if (s.d < gap + p.size + ph.slowR * 0.05) ts *= 0.2;
+        // steer к границе: тянем скорость к желаемой (ts вдоль нормали внутрь).
+        // У самого края ts→0, поэтому здесь же мягко гасится подплыв — давить в
+        // стенку рыбке больше не нужно, разведение по касательной делает решатель.
         ax += (-s.gx * ts - p.vx) * ph.steer;
         ay += (-s.gy * ts - p.vy) * ph.steer;
         // когерентная волна по полю: соседи колышутся вместе (плавно, не дёргано)
@@ -501,18 +538,31 @@ class Simulation {
           ax += Math.sin(p.y * wv.scale + this.time * wv.speed) * wf;
           ay += Math.sin(p.x * wv.scale - this.time * wv.speed * 0.9) * wf * 0.7;
         }
-        // упреждающее раздвигание: соседи на < 1.8× контакта — плавный толчок прочь
-        // не даёт рыбкам налезть друг на друга ещё до того как коллизии сработают
-        this.forEachNeighborFar(p, (q) => {
-          const dx = p.x - q.x, dy = p.y - q.y;
-          const dist = Math.hypot(dx, dy) || 1;
-          const minD = (p.size + q.size) * pc.packing * 1.8 * (1 + (this._shakeRepel || 0));
-          if (dist < minD) {
-            const force = (1 - dist / minD) * ph.collisionPush * 120 * (1 + (this._shakeRepel || 0) * 3);
-            ax += (dx / dist) * force;
-            ay += (dy / dist) * force;
+        // [swirl] касательное течение вдоль края — сильнее у самой границы
+        if (bh.swirl && bh.swirl.on) {
+          const band = clamp(1 - (s.d - gap - p.size) / (ph.slowR * 0.9), 0, 1);
+          const sw = bh.swirl.strength * maxV * 2.2 * band;
+          ax += -s.gy * sw; // касательная (−gy, gx)
+          ay += s.gx * sw;
+        }
+        // [adhere] адгезия: намагничиваем рыбку строго на контактную линию по
+        // всему радиусу + гасим скорость «наружу» (анти-отлипание). Получается
+        // плотный обмазывающий слой, в отличие от мягкой остановки по умолчанию.
+        if (bh.adhere && bh.adhere.on) {
+          const off = s.d - (gap + p.size); // >0 = ещё не на линии
+          const reach = ph.slowR;
+          if (off > -2 && off < reach) {
+            const near = 1 - clamp(off / reach, 0, 1); // 1 у самой линии
+            const k = bh.adhere.strength;
+            ax += -s.gx * off * k * 12; // тянем на поверхность
+            ay += -s.gy * off * k * 12;
+            const vn = p.vx * s.gx + p.vy * s.gy; // скорость наружу > 0
+            if (vn > 0) {
+              ax -= s.gx * vn * k * 8 * near;
+              ay -= s.gy * vn * k * 8 * near;
+            }
           }
-        });
+        }
         // направление взгляда — всегда к объекту
         const cx = this.obj.x - p.x,
           cy = this.obj.y - p.y;
@@ -540,50 +590,92 @@ class Simulation {
         }
       }
 
+      // [flock] стайность: выравнивание скорости + сплочение к центру группы
+      if (needFlock && nCount > 0) {
+        const inv = 1 / nCount;
+        if (bh.flock && bh.flock.on) {
+          ax += (alignX * inv - p.vx) * bh.flock.align * 10;
+          ay += (alignY * inv - p.vy) * bh.flock.align * 10;
+          ax += (cohX * inv - p.x) * bh.flock.cohesion * 6;
+          ay += (cohY * inv - p.y) * bh.flock.cohesion * 6;
+        }
+        // [density] сброс давления: в давке толкаемся прочь от локального центра
+        if (bh.density && bh.density.on && nCount >= bh.density.count) {
+          const awayX = p.x - cohX * inv, awayY = p.y - cohY * inv;
+          const al = Math.hypot(awayX, awayY) || 1;
+          const f = bh.density.strength * (nCount - bh.density.count + 1) * 80;
+          ax += (awayX / al) * f;
+          ay += (awayY / al) * f;
+        }
+      }
+
+      // [wander] собственное медленное блуждание курса
+      if (bh.wander && bh.wander.on) {
+        if (p.wanderAngle === undefined) p.wanderAngle = Math.random() * TAU;
+        p.wanderAngle += (Math.random() - 0.5) * dt * 6;
+        const wf = bh.wander.strength * ph.maxSpeed * 1.4;
+        ax += Math.cos(p.wanderAngle) * wf;
+        ay += Math.sin(p.wanderAngle) * wf;
+      }
+
+      // [gravity] постоянный снос (стекание / наполнение ёмкости)
+      if (bh.gravity && bh.gravity.on) {
+        const ga = (bh.gravity.angle * Math.PI) / 180;
+        ax += Math.cos(ga) * bh.gravity.strength;
+        ay += Math.sin(ga) * bh.gravity.strength;
+      }
+
+      // [temp] температура: непрерывная случайная ажитация
+      if (bh.temp && bh.temp.on) {
+        const tf = bh.temp.strength * ph.maxSpeed * 2.2;
+        ax += (Math.random() - 0.5) * tf;
+        ay += (Math.random() - 0.5) * tf;
+      }
+
+      // [predator] бегство от курсора
+      if (bh.predator && bh.predator.on && this.pointer.inside) {
+        const dx = p.x - this.pointer.x, dy = p.y - this.pointer.y;
+        const d = Math.hypot(dx, dy);
+        if (d < bh.predator.radius && d > 0.001) {
+          const f = bh.predator.force * (1 - d / bh.predator.radius);
+          ax += (dx / d) * f;
+          ay += (dy / d) * f;
+        }
+      }
+
+      // [wake] вихревой след за движущимся объектом
+      if (bh.wake && bh.wake.on && objSpeed > 20) {
+        const dx = p.x - this.obj.x, dy = p.y - this.obj.y;
+        const d = Math.hypot(dx, dy) || 1;
+        const reach = 240 * this.obj.scale;
+        if (d < reach) {
+          const side = Math.sign(dx * objVx + dy * objVy) || 1;
+          const fall = (1 - d / reach) * bh.wake.strength * 1.1;
+          ax += -objVy * fall * side + objVx * fall * 0.5; // закрутка + снос в кильватер
+          ay += objVx * fall * side + objVy * fall * 0.5;
+        }
+      }
+
+      // [mass] инерция от размера: крупные тяжелее (вялый разгон, ниже предел)
+      let respMaxV = ph.maxSpeed * p.eager;
+      if (bh.mass && bh.mass.on) {
+        const ratio = clamp(pc.baseSize / Math.max(1, p.size), 0.3, 2);
+        const resp = lerp(1, ratio, bh.mass.strength);
+        ax *= resp;
+        ay *= resp;
+        respMaxV *= clamp(resp, 0.4, 1.6);
+      }
+
+      // интегрируем скорость (с трением), ограничиваем, двигаем ПРЕДСКАЗАННУЮ позицию
       p.vx = (p.vx + ax * dt) * Math.pow(ph.friction, dt * 60);
       p.vy = (p.vy + ay * dt) * Math.pow(ph.friction, dt * 60);
-      const maxV = ph.maxSpeed * p.eager;
       const sp = Math.hypot(p.vx, p.vy);
-      if (sp > maxV) {
-        p.vx = (p.vx / sp) * maxV;
-        p.vy = (p.vy / sp) * maxV;
+      if (sp > respMaxV) {
+        p.vx = (p.vx / sp) * respMaxV;
+        p.vy = (p.vy / sp) * respMaxV;
       }
       p.x += p.vx * dt;
       p.y += p.vy * dt;
-
-      // спячка: микровибрации < порога гасим полностью — убивает дрыгание коллизий
-      let speed = Math.hypot(p.vx, p.vy);
-      // комфорт-зона: у самой границы гасим скорость плавно, не дёргано
-      if (!isAwake && s && speed > 0 && s.d < gap + p.size + ph.slowR * 0.25) {
-        const comfort = 1 - clamp((s.d - gap - p.size) / (ph.slowR * 0.25), 0, 1);
-        const damp = Math.pow(1 - comfort * 0.15, dt * 60);
-        p.vx *= damp;
-        p.vy *= damp;
-        speed = Math.hypot(p.vx, p.vy);
-      }
-      if (speed < ph.sleepThreshold) {
-        p.vx = 0;
-        p.vy = 0;
-      }
-
-      // трение вдоль границы: рыбки у бутылки не скользят вверх-вниз
-      if (s && !isAwake && s.d < gap + p.size + ph.slowR * 0.15) {
-        const tx = -s.gy, ty = s.gx;
-        const vt = p.vx * tx + p.vy * ty;
-        p.vx -= tx * vt * 0.9;
-        p.vy -= ty * vt * 0.9;
-      }
-
-      // анти-давка: если кто-то толкает рыбку внутрь объекта а она уже у края — демпфируем
-      if (s && s.d < gap + p.size + ph.slowR * 0.3) {
-        const intoObj = -(ax * s.gx + ay * s.gy);
-        if (intoObj > 0) {
-          const nearness = 1 - clamp((s.d - gap - p.size) / (ph.slowR * 0.3), 0, 1);
-          const damp = 1 - nearness * 0.85;
-          ax -= s.gx * intoObj * (1 - damp);
-          ay -= s.gy * intoObj * (1 - damp);
-        }
-      }
 
       const desired = Math.atan2(faceY, faceX);
       const smooth = pc.rotationSmoothness || 0;
@@ -601,12 +693,18 @@ class Simulation {
       }
     }
 
-    // --- 2. коллизии: позиционное разрешение по ориентированному эллипсу ---
-    const iters = ph.collisionIters;
+    // --- 2. решатель ограничений (PBD): коллизии рыбок + граница объекта ---
+    //     Всё позиционно и в ОДНОМ цикле. Граница решается сразу после парных
+    //     коллизий на каждой итерации, поэтому, когда задняя рыбка вдавливает
+    //     переднюю в объект, стенка тут же выталкивает переднюю, а перекрытие
+    //     уходит назад — к толкающей. Давление расходится по касательной (рыбки
+    //     облепляют силуэт), а не превращается в «дёрнули внутрь → выкинуло».
+    const iters = speedMode ? Math.max(3, Math.round(ph.collisionIters * 0.6)) : ph.collisionIters;
     const push = ph.collisionPush;
-    const rest = ph.restitution;
     for (let it = 0; it < iters; it++) {
-      this.rebuildHash(pc);
+      // в speed-режиме строим сетку один раз (положения за итерации меняются мало)
+      if (it === 0 || !speedMode) this.rebuildHash(pc);
+      // 2a. парные коллизии — позиционно, симметрично, по ориентированному эллипсу
       for (let i = 0; i < parts.length; i++) {
         const p = parts[i];
         const pa = p.size,
@@ -628,29 +726,45 @@ class Simulation {
           const packMul = 1 + (this._shakeRepel || 0);
           const minD = (rp + rq) * pc.packing * packMul;
           if (dist < minD) {
-            const overlap = minD - dist;
-            // симметрично разводим обе частицы
-            const corr = overlap * 0.5 * push * packMul;
+            const corr = (minD - dist) * 0.5 * push; // симметрично разводим
             p.x += nx * corr;
             p.y += ny * corr;
             q.x -= nx * corr;
             q.y -= ny * corr;
-            // отклик по скорости: гасим сближение
-            const rvn = (p.vx - q.vx) * nx + (p.vy - q.vy) * ny;
-            if (rvn < 0) {
-              const j = -rvn * (1 + rest) * 0.5;
-              p.vx += nx * j;
-              p.vy += ny * j;
-              q.vx -= nx * j;
-              q.vy -= ny * j;
-            }
           }
         });
       }
+      // 2b. граница объекта — жёсткая стенка (двигается только рыбка).
+      // в speed-режиме решаем стенку только на последней итерации (1×n семплов
+      // поля вместо iters×n) — со свежим семплом, без накопления ошибки.
+      if (!speedMode || it === iters - 1)
+        for (let i = 0; i < parts.length; i++) this.solveWall(parts[i]);
     }
 
-    // финальный кламп: коллизии могли затолкать в зону — выталкиваем
-    for (let i = 0; i < parts.length; i++) this.clampZone(parts[i]);
+    // --- 3. восстановление скорости из реального перемещения (PBD) ---
+    //     v = (x − x0)/dt: скорость отражает, КУДА рыбку реально пустили
+    //     ограничения. Упёршаяся в стенку рыбка получает v≈0 сама собой —
+    //     никакого накопленного отскока, поэтому нет прыжков и мельтешения.
+    const invDt = 1 / dt;
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      let nvx = (p.x - p.px0) * invDt;
+      let nvy = (p.y - p.py0) * invDt;
+      // ограничим всплески от глубоких разлёгиваний (накопленных перекрытий)
+      const cap = ph.maxSpeed * p.eager * 1.5;
+      const sp = Math.hypot(nvx, nvy);
+      if (sp > cap) {
+        nvx = (nvx / sp) * cap;
+        nvy = (nvy / sp) * cap;
+      }
+      p.vx = nvx;
+      p.vy = nvy;
+      // спячка: микродвижения < порога гасим полностью — рой замирает без дрожи
+      if (Math.hypot(p.vx, p.vy) < ph.sleepThreshold) {
+        p.vx = 0;
+        p.vy = 0;
+      }
+    }
 
     // --- 3. удаление улетевших далеко за край (край не стенка) ---
     const M = ph.cullMargin;
@@ -676,14 +790,22 @@ class Renderer {
   constructor() {
     this.bodySprite = null; // canvas для тела мелкого объекта (front = +X)
     this.useProcedural = true;
+    this.procShape = "eye"; // форма процедурной частицы
     this.frontOffset = 0; // рад: коррекция "переда" загруженного спрайта
     this.objSprite = null; // visual ∩ mask, кэш
     this.dotScale = 0.22; // размер зрачка процедурной частицы
   }
 
-  // процедурный "лепесток-глаз": передний кончик справа (+X).
-  // ratio = полнота (ширина/длина), point = острота кончиков, dot = размер зрачка
-  buildProceduralSprite(ratio = 0.5, point = 0.4, dot = 0.22) {
+  // процедурная частица. "eye" печётся в спрайт (белое тело + зрачок),
+  // остальные формы рисуются путём прямо в цикле и красятся цветом частицы.
+  buildProceduralSprite(shape = "eye", ratio = 0.5, point = 0.4, dot = 0.22) {
+    this.useProcedural = true;
+    this.procShape = shape || "eye";
+    this.dotScale = dot;
+    if (this.procShape !== "eye") {
+      this.bodySprite = null; // рисуем путём в draw()
+      return;
+    }
     const len = 120;
     const h = Math.max(8, len * ratio);
     const c = document.createElement("canvas");
@@ -703,8 +825,163 @@ class Renderer {
     ctx.strokeStyle = "rgba(0,0,0,0.35)";
     ctx.stroke();
     this.bodySprite = c;
-    this.useProcedural = true;
-    this.dotScale = dot;
+  }
+
+  // рисует тело частицы в локальном пространстве (front = +X, центр в 0).
+  // L = полудлина (= p.size), Wd = полуширина (= p.size*widthRatio).
+  // pr = cfg.proc: форм-специфичные параметры читаются вживую.
+  drawProcShape(ctx, shape, L, Wd, color, pr) {
+    ctx.fillStyle = color;
+    switch (shape) {
+      case "square": {
+        const rad = Math.min(L, Wd) * (pr.round || 0);
+        if (rad > 0.5 && ctx.roundRect) {
+          ctx.beginPath(); ctx.roundRect(-L, -Wd, L * 2, Wd * 2, rad); ctx.fill();
+        } else ctx.fillRect(-L, -Wd, L * 2, Wd * 2);
+        break;
+      }
+      case "needle": {
+        const sx = lerp(0, -L * 0.55, pr.point ?? 0.4);
+        ctx.beginPath();
+        ctx.moveTo(L, 0); ctx.lineTo(sx, -Wd); ctx.lineTo(-L, 0); ctx.lineTo(sx, Wd);
+        ctx.closePath(); ctx.fill();
+        break;
+      }
+      case "bird": {
+        const notch = -L * (0.05 + (pr.notch ?? 0.4) * 0.6);
+        ctx.beginPath();
+        ctx.moveTo(L, 0); ctx.lineTo(-L * 0.6, -Wd); ctx.lineTo(notch, 0); ctx.lineTo(-L * 0.6, Wd);
+        ctx.closePath(); ctx.fill();
+        break;
+      }
+      case "drop": {
+        const back = -L * lerp(0.35, 0.05, pr.point ?? 0.4);
+        ctx.beginPath();
+        ctx.moveTo(L, 0);
+        ctx.quadraticCurveTo(back, -Wd, -L, 0);
+        ctx.quadraticCurveTo(back, Wd, L, 0);
+        ctx.closePath(); ctx.fill();
+        break;
+      }
+      case "star": {
+        const n = Math.max(3, Math.round(pr.spikes ?? 5));
+        const inner = clamp(pr.depth ?? 0.45, 0.1, 0.95);
+        ctx.beginPath();
+        for (let i = 0; i < n * 2; i++) {
+          const a = (i * Math.PI) / n - Math.PI / 2;
+          const rad = i % 2 ? inner : 1;
+          const x = Math.cos(a) * L * rad, y = Math.sin(a) * Wd * rad;
+          i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+        }
+        ctx.closePath(); ctx.fill();
+        break;
+      }
+      case "polygon": {
+        const n = Math.max(3, Math.round(pr.sides ?? 6));
+        ctx.beginPath();
+        for (let i = 0; i < n; i++) {
+          const a = (i / n) * TAU - Math.PI / 2;
+          const x = Math.cos(a) * L, y = Math.sin(a) * Wd;
+          i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+        }
+        ctx.closePath(); ctx.fill();
+        break;
+      }
+      case "heart": {
+        // симметричное сердце Безье в единичных координатах, остриём в +X
+        const cl = -lerp(0.18, 0.6, pr.depth ?? 0.4); // глубина выемки сзади
+        ctx.save();
+        ctx.scale(L, Wd);
+        ctx.beginPath();
+        ctx.moveTo(cl, 0);
+        ctx.bezierCurveTo(-1.05, -0.15, -0.85, -1.05, -0.2, -1.0);
+        ctx.bezierCurveTo(0.25, -0.95, 0.6, -0.4, 1.0, 0);
+        ctx.bezierCurveTo(0.6, 0.4, 0.25, 0.95, -0.2, 1.0);
+        ctx.bezierCurveTo(-0.85, 1.05, -1.05, 0.15, cl, 0);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+        break;
+      }
+      case "crescent": {
+        // чистый серп = луна между двумя дугами равных кругов в единичном
+        // пространстве (масштаб L×Wd). d — смещение вырезающего круга.
+        const hole = clamp(pr.hole ?? 0.5, 0.1, 0.9);
+        const d = lerp(1.05, 0.5, hole); // больше hole → тоньше серп
+        const ax = d / 2;
+        const ay = Math.sqrt(Math.max(1e-4, 1 - ax * ax));
+        const thO = Math.atan2(ay, ax);       // угол пересечения на внешнем круге
+        const thI = Math.atan2(ay, ax - d);   // на вырезающем круге
+        ctx.save();
+        ctx.scale(L, Wd);
+        ctx.beginPath();
+        ctx.arc(0, 0, 1, thO, TAU - thO, false);   // внешний лимб (большая дуга слева)
+        ctx.arc(d, 0, 1, TAU - thI, thI, true);    // внутренняя дуга-вырез обратно
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+        break;
+      }
+      case "ring": {
+        const hole = clamp(pr.hole ?? 0.5, 0.1, 0.9);
+        ctx.beginPath();
+        ctx.ellipse(0, 0, L, Wd, 0, 0, TAU);
+        ctx.ellipse(0, 0, L * hole, Wd * hole, 0, 0, TAU, true);
+        ctx.fill("evenodd");
+        break;
+      }
+      case "fish": {
+        const t = pr.tail ?? 0.5;
+        const point = pr.point ?? 0.4;
+        const nose = L;
+        const bx = -L * 0.42;          // конец тела / основание хвоста
+        const mx = lerp((nose + bx) / 2, nose * 0.1, point); // острее нос → пик ближе к носу
+        // тело — симметричная линза
+        ctx.beginPath();
+        ctx.moveTo(nose, 0);
+        ctx.quadraticCurveTo(mx, -Wd, bx, 0);
+        ctx.quadraticCurveTo(mx, Wd, nose, 0);
+        ctx.closePath(); ctx.fill();
+        // хвост — раздвоённый плавник с выемкой
+        const ty = Wd * (0.7 + t);
+        ctx.beginPath();
+        ctx.moveTo(bx + L * 0.06, 0);
+        ctx.lineTo(-L, -ty);
+        ctx.lineTo(-L * 0.74, 0);
+        ctx.lineTo(-L, ty);
+        ctx.closePath(); ctx.fill();
+        break;
+      }
+      case "flower": {
+        const n = Math.max(3, Math.round(pr.petals ?? 6));
+        for (let i = 0; i < n; i++) {
+          const a = (i / n) * TAU;
+          ctx.save();
+          ctx.translate(Math.cos(a) * L * 0.5, Math.sin(a) * Wd * 0.5);
+          ctx.rotate(a);
+          ctx.beginPath(); ctx.ellipse(0, 0, L * 0.5, Wd * 0.3, 0, 0, TAU); ctx.fill();
+          ctx.restore();
+        }
+        ctx.beginPath(); ctx.arc(0, 0, Math.min(L, Wd) * 0.38, 0, TAU); ctx.fill();
+        break;
+      }
+      case "arrow": {
+        const headLen = L * lerp(0.5, 1.0, pr.point ?? 0.5);
+        const sw = Wd * 0.42;
+        ctx.beginPath();
+        ctx.moveTo(L, 0);
+        ctx.lineTo(L - headLen, -Wd); ctx.lineTo(L - headLen, -sw);
+        ctx.lineTo(-L, -sw); ctx.lineTo(-L, sw);
+        ctx.lineTo(L - headLen, sw); ctx.lineTo(L - headLen, Wd);
+        ctx.closePath(); ctx.fill();
+        break;
+      }
+      default: { // "dot" и фолбэк — эллипс
+        ctx.beginPath();
+        ctx.ellipse(0, 0, L, Wd, 0, 0, TAU);
+        ctx.fill();
+      }
+    }
   }
 
   setSpriteImage(img, frontOffsetRad) {
@@ -762,33 +1039,39 @@ class Renderer {
 
     // мелкие объекты
     const proc = this.useProcedural;
+    const shape = this.procShape;
     const sprite = this.bodySprite;
     const foff = proc ? 0 : this.frontOffset;
-    if (sprite) {
-      const sw = sprite.width,
-        sh = sprite.height;
+    const wr = cfg.particle.widthRatio;
+    const pathMode = proc && shape !== "eye"; // формы кроме глаза рисуем путём
+    if (pathMode || sprite) {
+      const sw = sprite ? sprite.width : 0;
+      const sh = sprite ? sprite.height : 0;
       for (let i = 0; i < sim.particles.length; i++) {
         const p = sim.particles[i];
-        const sc = (p.size * 2) / sw; // визуальный размер (он же для коллизий)
         ctx.save();
         ctx.translate(p.x, p.y);
         ctx.rotate(p.angle + foff);
-        ctx.scale(sc, sc);
-        ctx.drawImage(sprite, -sw / 2, -sh / 2);
-        // цветной "зрачок" у переднего кончика (только для процедурного)
-        if (proc) {
-          ctx.beginPath();
-          ctx.arc(sw * 0.25, 0, sh * this.dotScale, 0, TAU);
-          ctx.fillStyle = p.dot;
-          ctx.fill();
-          // чёрный зрачок внутри радужки, у её переднего края
-          const irisR = sh * this.dotScale;
-          const pupilR = irisR * 0.45;
-          const pupilOff = irisR - pupilR; // смещение внутри радужки к краю
-          ctx.beginPath();
-          ctx.arc(sw * 0.25 + pupilOff, 0, pupilR, 0, TAU);
-          ctx.fillStyle = "#000";
-          ctx.fill();
+        if (pathMode) {
+          this.drawProcShape(ctx, shape, p.size, p.size * wr, p.dot, cfg.proc);
+        } else {
+          const sc = (p.size * 2) / sw; // визуальный размер (он же для коллизий)
+          ctx.scale(sc, sc);
+          ctx.drawImage(sprite, -sw / 2, -sh / 2);
+          // цветной "зрачок" у переднего кончика (только для глаза)
+          if (proc) {
+            ctx.beginPath();
+            ctx.arc(sw * 0.25, 0, sh * this.dotScale, 0, TAU);
+            ctx.fillStyle = p.dot;
+            ctx.fill();
+            const irisR = sh * this.dotScale;
+            const pupilR = irisR * 0.45;
+            const pupilOff = irisR - pupilR; // смещение внутри радужки к краю
+            ctx.beginPath();
+            ctx.arc(sw * 0.25 + pupilOff, 0, pupilR, 0, TAU);
+            ctx.fillStyle = "#000";
+            ctx.fill();
+          }
         }
         ctx.restore();
       }
@@ -853,6 +1136,241 @@ function makeLabelVisual(maskW, maskH) {
   return c;
 }
 
+/* ===================== процедурные маски силуэтов ====================== */
+function makeShapeCanvas(w, h, paint) {
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#fff";
+  ctx.strokeStyle = "#fff";
+  paint(ctx, w, h);
+  return c;
+}
+function makeMask(shape) {
+  switch (shape) {
+    case "bottle":
+      return makeBottleMask();
+    case "circle":
+      return makeShapeCanvas(440, 440, (ctx, w, h) => {
+        ctx.beginPath();
+        ctx.arc(w / 2, h / 2, w * 0.42, 0, TAU);
+        ctx.fill();
+      });
+    case "heart":
+      return makeShapeCanvas(460, 440, (ctx, w, h) => {
+        const x = w / 2, y = h * 0.34, s = w * 0.42;
+        ctx.beginPath();
+        ctx.moveTo(x, y + s * 0.3);
+        ctx.bezierCurveTo(x, y, x - s, y - s * 0.2, x - s, y + s * 0.35);
+        ctx.bezierCurveTo(x - s, y + s * 0.9, x, y + s * 1.15, x, y + s * 1.5);
+        ctx.bezierCurveTo(x, y + s * 1.15, x + s, y + s * 0.9, x + s, y + s * 0.35);
+        ctx.bezierCurveTo(x + s, y - s * 0.2, x, y, x, y + s * 0.3);
+        ctx.closePath();
+        ctx.fill();
+      });
+    case "star":
+      return makeShapeCanvas(460, 460, (ctx, w, h) => {
+        const cx = w / 2, cy = h / 2, R = w * 0.46, r = R * 0.42, n = 5;
+        ctx.beginPath();
+        for (let i = 0; i < n * 2; i++) {
+          const ang = (i * Math.PI) / n - Math.PI / 2;
+          const rad = i % 2 ? r : R;
+          const px = cx + Math.cos(ang) * rad, py = cy + Math.sin(ang) * rad;
+          i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+        }
+        ctx.closePath();
+        ctx.fill();
+      });
+    case "ring":
+      return makeShapeCanvas(480, 480, (ctx, w, h) => {
+        ctx.beginPath();
+        ctx.arc(w / 2, h / 2, w * 0.44, 0, TAU);
+        ctx.arc(w / 2, h / 2, w * 0.24, 0, TAU, true); // дырка (evenodd)
+        ctx.fill("evenodd");
+      });
+    case "branch":
+      return makeShapeCanvas(420, 560, (ctx, w, h) => {
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        const cx = w / 2;
+        const limb = (x1, y1, x2, y2, lw) => {
+          ctx.lineWidth = lw;
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+        };
+        limb(cx, h - 20, cx, h * 0.32, 26);       // ствол
+        limb(cx, h * 0.62, cx - 110, h * 0.42, 16); // ветка влево
+        limb(cx, h * 0.5, cx + 120, h * 0.3, 16);  // ветка вправо
+        limb(cx - 70, h * 0.5, cx - 130, h * 0.6, 9);
+        limb(cx + 60, h * 0.4, cx + 120, h * 0.5, 9);
+        limb(cx, h * 0.32, cx - 50, h * 0.16, 11);
+        limb(cx, h * 0.34, cx + 60, h * 0.14, 11);
+      });
+    case "letterA":
+      return makeShapeCanvas(380, 480, (ctx, w, h) => {
+        ctx.fillStyle = "#fff";
+        ctx.font = "900 460px ui-sans-serif, system-ui, sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("A", w / 2, h / 2 + 24);
+      });
+    case "drop":
+      return makeShapeCanvas(360, 520, (ctx, w, h) => {
+        const cx = w / 2;
+        ctx.beginPath();
+        ctx.moveTo(cx, 30);
+        ctx.bezierCurveTo(cx + 150, h * 0.45, cx + 130, h - 30, cx, h - 30);
+        ctx.bezierCurveTo(cx - 130, h - 30, cx - 150, h * 0.45, cx, 30);
+        ctx.closePath();
+        ctx.fill();
+      });
+    default:
+      return makeBottleMask();
+  }
+}
+
+/* ============================= пресеты-«характеры» ===================== */
+// неглубокий мердж переопределений пресета поверх клона дефолтного конфига
+function mergeDeep(base, ov) {
+  for (const k in ov) {
+    const v = ov[k];
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      base[k] = mergeDeep(base[k] || {}, v);
+    } else {
+      base[k] = v;
+    }
+  }
+  return base;
+}
+// рекомендуемая «полнота» эллипса коллизии под форму
+const SHAPE_WR = {
+  eye: 0.7, dot: 0.95, square: 0.85, needle: 0.22, bird: 0.6, drop: 0.55,
+  star: 0.95, polygon: 0.9, heart: 0.9, crescent: 0.95, ring: 0.95, fish: 0.55, flower: 0.95, arrow: 0.6,
+};
+const PRESETS = [
+  {
+    key: "argus", label: "👁 Аргус", mask: "circle", scale: 1.0,
+    cfg: {
+      canvas: { bg: "#070707" },
+      object: { gap: 2, faceMode: "center", showVisual: false, innerScale: 0.5 },
+      proc: { shape: "eye", ratio: 0.72, point: 0.32, dot: 0.36 },
+      particle: { baseSize: 18, widthRatio: 0.72, topScale: 1, bottomScale: 1, sizeRandMin: 0.85, sizeRandMax: 1.15, palette: ["#b41818", "#8c0e0e", "#c23a3a", "#5a0a0a"] },
+      physics: { maxSpeed: 170, sleepThreshold: 9, packing: 0.93, slowR: 180 },
+      behaviors: { adhere: { on: true, strength: 0.4 } },
+    },
+  },
+  {
+    key: "brutal", label: "🅰 Брутализм", mask: "letterA", scale: 1.0,
+    cfg: {
+      canvas: { bg: "#b8b5ad" },
+      object: { gap: 1, faceMode: "edge", showVisual: false },
+      proc: { shape: "square" },
+      particle: { baseSize: 13, widthRatio: 0.85, turnSpeed: 40, rotationSmoothness: 0, topScale: 1, bottomScale: 1, sizeRandMin: 1, sizeRandMax: 1, packing: 1.15, palette: ["#111111", "#1c1c1c", "#0a0a0a"] },
+      physics: { maxSpeed: 220, sleepThreshold: 5, slowR: 160 },
+      behaviors: { temp: { on: true, strength: 0.18 } },
+    },
+  },
+  {
+    key: "gold", label: "🜚 Жидкое золото", mask: "drop", scale: 1.0,
+    cfg: {
+      canvas: { bg: "#100b04" },
+      object: { gap: 2, faceMode: "edge", showVisual: false },
+      proc: { shape: "dot" },
+      particle: { baseSize: 15, widthRatio: 0.95, topScale: 1, bottomScale: 1, sizeRandMin: 0.85, sizeRandMax: 1.2, packing: 0.86, palette: ["#f4cf5a", "#e6b53c", "#caa12f", "#fff0b0", "#b8862a"] },
+      physics: { friction: 0.97, maxSpeed: 150, sleepThreshold: 7, slowR: 220 },
+      behaviors: { membrane: { on: true, stiffness: 0.4, radius: 64 }, adhere: { on: true, strength: 0.5 } },
+    },
+  },
+  {
+    key: "plankton", label: "✦ Планктон", mask: "circle", scale: 0.7,
+    cfg: {
+      canvas: { bg: "#02040a" },
+      object: { gap: 6, faceMode: "center", showVisual: false },
+      proc: { shape: "dot" },
+      particle: { baseSize: 5, widthRatio: 0.95, growSeconds: 2, topScale: 1, bottomScale: 1, sizeRandMin: 0.6, sizeRandMax: 1.6, packing: 0.9, palette: ["#27f2d6", "#2f8bff", "#b14bff", "#5cff8f", "#ff4bd6"] },
+      physics: { friction: 0.9, maxSpeed: 120, sleepThreshold: 2, slowR: 300 },
+      behaviors: { wander: { on: true, strength: 0.6 }, flock: { on: true, align: 0.3, cohesion: 0.2, radius: 80 } },
+    },
+  },
+  {
+    key: "crows", label: "🐦‍⬛ Вороны", mask: "branch", scale: 1.0,
+    cfg: {
+      canvas: { bg: "#eceae2" },
+      object: { gap: 4, faceMode: "edge", showVisual: false },
+      proc: { shape: "bird" },
+      particle: { baseSize: 11, widthRatio: 0.6, topScale: 1, bottomScale: 1, sizeRandMin: 0.7, sizeRandMax: 1.3, packing: 1.0, palette: ["#111111", "#000000", "#1f1f1f"] },
+      physics: { friction: 0.92, maxSpeed: 320, sleepThreshold: 1, slowR: 260 },
+      behaviors: { flock: { on: true, align: 0.7, cohesion: 0.4, radius: 90 }, wander: { on: true, strength: 0.5 } },
+    },
+  },
+  {
+    key: "magnet", label: "🧲 Магнит", mask: "ring", scale: 1.0,
+    cfg: {
+      canvas: { bg: "#0c0d10" },
+      object: { gap: 2, faceMode: "edge", showVisual: false },
+      proc: { shape: "needle" },
+      particle: { baseSize: 14, widthRatio: 0.22, topScale: 1, bottomScale: 1, sizeRandMin: 0.9, sizeRandMax: 1.1, packing: 0.95, palette: ["#9aa0a8", "#c2c8d0", "#7a808a", "#dfe4ea"] },
+      physics: { friction: 0.94, maxSpeed: 240, sleepThreshold: 4, slowR: 240 },
+      behaviors: { adhere: { on: true, strength: 0.6 }, swirl: { on: true, strength: 0.5 } },
+    },
+  },
+  {
+    key: "glitch", label: "▦ Глитч", mask: "bottle", scale: 0.95,
+    cfg: {
+      canvas: { bg: "#0a0a0a" },
+      object: { gap: 2, faceMode: "edge", showVisual: false },
+      proc: { shape: "square" },
+      particle: { baseSize: 12, widthRatio: 1.0, turnSpeed: 40, topScale: 1, bottomScale: 1, sizeRandMin: 0.7, sizeRandMax: 1.4, packing: 1.1, palette: ["#ff0000", "#00ff00", "#0000ff", "#ffffff", "#ff00ff"] },
+      physics: { friction: 0.9, maxSpeed: 360, sleepThreshold: 0, restitution: 0.5, slowR: 200 },
+      behaviors: { temp: { on: true, strength: 0.7 } },
+    },
+  },
+  {
+    key: "coral", label: "🪸 Коралл", mask: "heart", scale: 1.0,
+    cfg: {
+      canvas: { bg: "#160a10" },
+      object: { gap: 2, faceMode: "edge", showVisual: false },
+      proc: { shape: "drop" },
+      particle: { baseSize: 13, widthRatio: 0.55, topScale: 0.9, bottomScale: 1.2, sizeRandMin: 0.7, sizeRandMax: 1.3, packing: 0.92, palette: ["#ff6f61", "#ff9a8b", "#ef476f", "#ffb4a2", "#e85d75"] },
+      physics: { friction: 0.95, maxSpeed: 180, sleepThreshold: 4, slowR: 240 },
+      behaviors: { membrane: { on: true, stiffness: 0.3, radius: 58 }, adhere: { on: true, strength: 0.5 }, gravity: { on: true, strength: 90, angle: 90 } },
+    },
+  },
+  {
+    key: "sumi", label: "⟡ Сумиэ", mask: "branch", scale: 1.0,
+    cfg: {
+      canvas: { bg: "#f4f1ea" },
+      spawn: { maxParticles: 220 },
+      object: { gap: 6, faceMode: "edge", showVisual: false },
+      proc: { shape: "drop" },
+      particle: { baseSize: 14, widthRatio: 0.6, growSeconds: 2.5, topScale: 0.8, bottomScale: 1.2, sizeRandMin: 0.6, sizeRandMax: 1.5, packing: 1.0, palette: ["#15110d", "#000000", "#2a241d"] },
+      physics: { friction: 0.94, maxSpeed: 130, sleepThreshold: 2, slowR: 260 },
+      behaviors: { wander: { on: true, strength: 0.4 }, gravity: { on: true, strength: 70, angle: 90 } },
+    },
+  },
+  {
+    key: "vabank", label: "💥 Ва-банк", mask: "star", scale: 1.0,
+    cfg: {
+      canvas: { bg: "#0a0a0a" },
+      spawn: { burst: 380 },
+      object: { gap: 2, faceMode: "inner", showVisual: false, innerScale: 0.6 },
+      proc: { shape: "eye", ratio: 0.7, point: 0.4, dot: 0.24 },
+      particle: { baseSize: 15, widthRatio: 0.7, topScale: 0.7, bottomScale: 1.5, sizeRandMin: 0.4, sizeRandMax: 2.4, packing: 0.96, palette: ["#e23b3b", "#e6772f", "#e6c12f", "#27a567", "#1fb3b3", "#2f6fe2", "#8a3bc9", "#d23b9c"] },
+      physics: { friction: 0.92, maxSpeed: 420, sleepThreshold: 3, slowR: 240 },
+      behaviors: {
+        flock: { on: true, align: 0.4, cohesion: 0.3, radius: 70 },
+        swirl: { on: true, strength: 0.5 },
+        wander: { on: true, strength: 0.4 },
+        temp: { on: true, strength: 0.3 },
+        density: { on: true, strength: 0.5, count: 6 },
+      },
+    },
+  },
+];
+
 /* ============================= конфиг по умолчанию ====================== */
 const DEFAULT_PALETTE = [
   "#e23b3b", "#2f6fe2", "#27a567", "#e6c12f", "#8a3bc9",
@@ -884,7 +1402,10 @@ function defaultConfig() {
       palette: DEFAULT_PALETTE,
       variations: 5,
     },
-    proc: { ratio: 0.7, point: 0.4, dot: 0.22 },
+    proc: {
+      shape: "eye", ratio: 0.7, point: 0.4, dot: 0.22,
+      round: 0.3, notch: 0.4, spikes: 5, depth: 0.45, sides: 6, hole: 0.5, tail: 0.5, petals: 6,
+    },
     physics: {
       friction: 0.93,
       steer: 5,
@@ -901,6 +1422,21 @@ function defaultConfig() {
       sleepThreshold: 6,
     },
     wave: { amp: 12, scale: 0.012, speed: 1.2 },
+    perf: { mode: "quality" }, // quality | speed | auto — нагрузка решателя
+    // подключаемые режимы поведения (каждый включается тумблером в левой панели)
+    behaviors: {
+      flock:    { on: false, align: 0.5, cohesion: 0.4, radius: 70 }, // стайность boids
+      swirl:    { on: false, strength: 0.5 },        // касательное течение вдоль края
+      wander:   { on: false, strength: 0.5 },        // собственное блуждание
+      mass:     { on: false, strength: 0.6 },        // инерция от размера
+      gravity:  { on: false, strength: 220, angle: 90 }, // постоянный снос (90°=вниз)
+      density:  { on: false, strength: 0.6, count: 6 },  // сброс давления в давке
+      predator: { on: false, radius: 130, force: 900 },  // бегство от курсора
+      wake:     { on: false, strength: 1.0 },        // вихревой след за объектом
+      temp:     { on: false, strength: 0.5 },        // непрерывная ажитация
+      membrane: { on: false, stiffness: 0.25, radius: 60 }, // мягкое тело (PBD-пружины)
+      adhere:   { on: false, strength: 0.5 },        // прилипание к поверхности
+    },
     field: { res: 220 },
   };
 }
@@ -1012,6 +1548,18 @@ function Section({ title, children, open = true }) {
     </div>
   );
 }
+// тумблер режима поведения: чекбокс + (когда включён) его слайдеры
+function Toggle({ label, on, onChange, children }) {
+  return (
+    <div className="mb-1.5">
+      <label className="flex items-center gap-2 text-[11px] py-1 cursor-pointer select-none">
+        <input type="checkbox" className="accent-amber-500" checked={on} onChange={(e) => onChange(e.target.checked)} />
+        <span className={on ? "text-amber-400 font-medium" : "text-neutral-300"}>{label}</span>
+      </label>
+      {on && <div className="pl-3 ml-1 border-l border-neutral-800">{children}</div>}
+    </div>
+  );
+}
 function FileRow({ label, accept, onFile }) {
   const ref = useRef(null);
   return (
@@ -1045,6 +1593,7 @@ export default function App() {
   const maskRef = useRef(null); // текущий canvas маски
   const rafRef = useRef(0);
   const lastT = useRef(0);
+  const fpsAcc = useRef({ t: 0, n: 0 }); // усреднение FPS, чтобы счётчик не мельтешил
   const mouse = useRef({ down: false, x: 0, y: 0, dragOff: { x: 0, y: 0 } });
 
   const [cfg, setCfg] = useState(defaultConfig());
@@ -1054,6 +1603,7 @@ export default function App() {
   const [fps, setFps] = useState(0);
   const [frontDeg, setFrontDeg] = useState(0);
   const [recording, setRecording] = useState(false);
+  const [activePreset, setActivePreset] = useState(null);
   const mediaRecRef = useRef(null);
 
   // храним актуальный конфиг в ref, чтобы цикл не пересоздавался
@@ -1078,7 +1628,7 @@ export default function App() {
     sim.cfg = cfgRef.current;
     const rend = new Renderer();
     const pp = cfgRef.current.proc;
-    rend.buildProceduralSprite(pp.ratio, pp.point, pp.dot);
+    rend.buildProceduralSprite(pp.shape, cfgRef.current.particle.widthRatio, pp.point, pp.dot);
     simRef.current = sim;
     rendRef.current = rend;
 
@@ -1107,8 +1657,16 @@ export default function App() {
         // эмиссия при зажатой мыши в режиме spawn
         if (mouse.current.down && modeRef.current === "spawn")
           sim.spawn(mouse.current.x, mouse.current.y);
-        setCount(sim.particles.length);
-        if (dt > 0) setFps(Math.round(1 / dt));
+        // обновляем счётчики ~3 раза в секунду усреднённым FPS (без мельтешения)
+        const acc = fpsAcc.current;
+        acc.t += dt;
+        acc.n += 1;
+        if (acc.t >= 0.33) {
+          setFps(Math.round(acc.n / acc.t));
+          setCount(sim.particles.length);
+          acc.t = 0;
+          acc.n = 0;
+        }
       }
       rafRef.current = requestAnimationFrame(loop);
     };
@@ -1126,11 +1684,12 @@ export default function App() {
     const r = rendRef.current;
     if (!r) return;
     if (r.useProcedural) {
-      r.buildProceduralSprite(cfg.proc.ratio, cfg.proc.point, cfg.proc.dot);
-      set("particle.widthRatio", cfg.proc.ratio);
+      // глаз печётся в спрайт (высота тела = полнота widthRatio); остальные формы
+      // рисуются вживую в draw() и не требуют пересборки.
+      r.buildProceduralSprite(cfg.proc.shape, cfg.particle.widthRatio, cfg.proc.point, cfg.proc.dot);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cfg.proc.ratio, cfg.proc.point, cfg.proc.dot]);
+  }, [cfg.proc.shape, cfg.particle.widthRatio, cfg.proc.point, cfg.proc.dot]);
 
   /* ------------------------ загрузка файлов ------------------------- */
   const loadImage = (file) =>
@@ -1169,6 +1728,28 @@ export default function App() {
     set("particle.widthRatio", clamp(img.height / img.width, 0.15, 1));
   };
 
+  // применить пресет-«характер»: конфиг + маска + форма частицы + заполнение
+  const applyPreset = (preset) => {
+    const sim = simRef.current, rend = rendRef.current;
+    if (!sim || !rend) return;
+    const c = mergeDeep(structuredClone(defaultConfig()), preset.cfg);
+    cfgRef.current = c;
+    sim.cfg = c;
+    setCfg(c);
+    const mask = makeMask(preset.mask);
+    maskRef.current = mask;
+    rend.buildObjSprite(mask, null);
+    sim.setField(new DistanceField(mask, c.field.res));
+    rend.buildProceduralSprite(c.proc.shape, c.particle.widthRatio, c.proc.point, c.proc.dot);
+    sim.obj.x = c.canvas.w / 2;
+    sim.obj.y = c.canvas.h / 2;
+    sim.obj.scale = preset.scale ?? 0.95;
+    sim.obj.rot = 0;
+    sim.clear();
+    sim.fillCanvas(c.canvas.w, c.canvas.h); // мгновенный результат
+    setActivePreset(preset.key);
+  };
+
   // обновление front offset для загруженного спрайта
   useEffect(() => {
     if (rendRef.current && !rendRef.current.useProcedural)
@@ -1203,6 +1784,7 @@ export default function App() {
     const p = evtPos(e);
     mouse.current.x = p.x;
     mouse.current.y = p.y;
+    if (simRef.current) { simRef.current.pointer.x = p.x; simRef.current.pointer.y = p.y; simRef.current.pointer.inside = true; }
     if (mode === "move" && mouse.current.down) {
       const o = simRef.current.obj;
       o.x = p.x + mouse.current.dragOff.x;
@@ -1289,6 +1871,27 @@ export default function App() {
     <div className="flex w-full h-screen bg-neutral-950 text-neutral-200 font-sans">
       {/* левая панель — визуал / ассеты */}
       <div className="w-64 bg-neutral-900 border-r border-neutral-800 overflow-y-auto shrink-0">
+        <Section title="✨ Пресеты">
+          <p className="text-[10px] text-neutral-500 leading-relaxed mb-2">
+            Готовые «характеры»: объект + форма + палитра + поведение. Клик — применить и заполнить.
+          </p>
+          <div className="grid grid-cols-2 gap-1.5">
+            {PRESETS.map((p) => (
+              <button
+                key={p.key}
+                onClick={() => applyPreset(p)}
+                className={`text-[10px] px-2 py-2 rounded text-left leading-tight transition-colors ${
+                  activePreset === p.key
+                    ? "bg-amber-500 text-black font-medium"
+                    : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"
+                }`}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+        </Section>
+
         <Section title="Объект">
           <FileRow label="Маска зоны (ЧБ/альфа)" accept="image/*" onFile={onMaskFile} />
           <FileRow label="Визуал объекта" accept="image/*" onFile={onVisualFile} />
@@ -1322,8 +1925,9 @@ export default function App() {
           <button
             onClick={() => {
               const pp = cfgRef.current.proc;
-              rendRef.current.buildProceduralSprite(pp.ratio, pp.point, pp.dot);
-              set("particle.widthRatio", pp.ratio);
+              set("proc.shape", "eye");
+              set("particle.widthRatio", SHAPE_WR.eye);
+              rendRef.current.buildProceduralSprite("eye", SHAPE_WR.eye, pp.point, pp.dot);
             }}
             className="w-full text-[11px] px-2 py-1.5 rounded bg-neutral-800 hover:bg-neutral-700 mt-1"
           >
@@ -1332,9 +1936,58 @@ export default function App() {
         </Section>
 
         <Section title="Форма агента">
-          <Slider label="Полнота (шир/длин)" desc="Соотношение ширины к длине процедурной рыбки. 0.3 = узкая стрелка, 1 = круг." value={cfg.proc.ratio} min={0.15} max={1} step={0.01} onChange={(v) => set("proc.ratio", v)} fmt={(v)=>v.toFixed(2)} />
-          <Slider label="Острота кончика" desc="Насколько заострён передний кончик рыбки. 0 = тупой овал, 1 = игла." value={cfg.proc.point} min={0} max={1} step={0.02} onChange={(v) => set("proc.point", v)} fmt={(v)=>v.toFixed(2)} />
-          <Slider label="Размер зрачка" desc="Диаметр цветного зрачка на кончике рыбки. 0 = без зрачка, 0.45 = полглаза." value={cfg.proc.dot} min={0} max={0.45} step={0.01} onChange={(v) => set("proc.dot", v)} fmt={(v)=>v.toFixed(2)} />
+          <div className="text-[11px] text-neutral-400 mb-1">Тип частицы</div>
+          <div className="grid grid-cols-3 gap-1 mb-2">
+            {([
+              ["eye","Глаз"],["dot","Точка"],["square","Квадрат"],
+              ["needle","Игла"],["bird","Птица"],["drop","Капля"],
+              ["fish","Рыба"],["arrow","Стрелка"],["star","Звезда"],
+              ["polygon","Поли"],["heart","Сердце"],["flower","Цветок"],
+              ["ring","Кольцо"],["crescent","Месяц"],
+            ]).map(([s, lbl]) => (
+              <button key={s}
+                onClick={() => { set("proc.shape", s); set("particle.widthRatio", SHAPE_WR[s]); }}
+                className={`text-[10px] px-1 py-1 rounded ${cfg.proc.shape === s ? "bg-amber-500 text-black" : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"}`}
+              >{lbl}</button>
+            ))}
+          </div>
+
+          {/* общая для всех форм «полнота» = эллипс коллизии и пропорция тела */}
+          <Slider label="Полнота (шир/длин)" desc="Соотношение ширины к длине частицы. 0.2 = узкая/длинная, 1 = круглая. Влияет и на форму, и на эллипс коллизий." value={cfg.particle.widthRatio} min={0.15} max={1} step={0.01} onChange={(v) => set("particle.widthRatio", v)} fmt={(v)=>v.toFixed(2)} />
+
+          {/* контекстные параметры под выбранную форму */}
+          {cfg.proc.shape === "eye" && (<>
+            <Slider label="Острота кончика" desc="Насколько заострён передний кончик глаза. 0 = тупой овал, 1 = игла." value={cfg.proc.point} min={0} max={1} step={0.02} onChange={(v) => set("proc.point", v)} fmt={(v)=>v.toFixed(2)} />
+            <Slider label="Размер зрачка" desc="Диаметр цветного зрачка на кончике. 0 = без зрачка, 0.45 = полглаза." value={cfg.proc.dot} min={0} max={0.45} step={0.01} onChange={(v) => set("proc.dot", v)} fmt={(v)=>v.toFixed(2)} />
+          </>)}
+          {(cfg.proc.shape === "drop" || cfg.proc.shape === "needle" || cfg.proc.shape === "fish" || cfg.proc.shape === "arrow") && (
+            <Slider label="Острота носа" desc="Насколько вытянут и заострён передний кончик." value={cfg.proc.point} min={0} max={1} step={0.02} onChange={(v) => set("proc.point", v)} fmt={(v)=>v.toFixed(2)} />
+          )}
+          {cfg.proc.shape === "fish" && (
+            <Slider label="Хвост" desc="Размах хвостового плавника." value={cfg.proc.tail} min={0} max={1.2} step={0.05} onChange={(v) => set("proc.tail", v)} fmt={(v)=>v.toFixed(2)} />
+          )}
+          {cfg.proc.shape === "bird" && (
+            <Slider label="Изгиб крыльев" desc="Глубина выреса между крыльями. Больше = острее «галочка»." value={cfg.proc.notch} min={0} max={1} step={0.02} onChange={(v) => set("proc.notch", v)} fmt={(v)=>v.toFixed(2)} />
+          )}
+          {cfg.proc.shape === "square" && (
+            <Slider label="Скругление углов" desc="0 = острый квадрат, 1 = почти круг." value={cfg.proc.round} min={0} max={1} step={0.05} onChange={(v) => set("proc.round", v)} fmt={(v)=>v.toFixed(2)} />
+          )}
+          {cfg.proc.shape === "star" && (<>
+            <Slider label="Лучей" desc="Количество лучей звезды." value={cfg.proc.spikes} min={3} max={12} step={1} onChange={(v) => set("proc.spikes", v)} />
+            <Slider label="Глубина лучей" desc="Насколько глубоко вырезаны лучи. Меньше = острее звезда." value={cfg.proc.depth} min={0.1} max={0.9} step={0.05} onChange={(v) => set("proc.depth", v)} fmt={(v)=>v.toFixed(2)} />
+          </>)}
+          {cfg.proc.shape === "polygon" && (
+            <Slider label="Сторон" desc="Число сторон многоугольника. 3 = треугольник, 6 = шестиугольник." value={cfg.proc.sides} min={3} max={10} step={1} onChange={(v) => set("proc.sides", v)} />
+          )}
+          {cfg.proc.shape === "heart" && (
+            <Slider label="Полнота лопастей" desc="Размер верхних долей сердца." value={cfg.proc.depth} min={0.1} max={0.9} step={0.05} onChange={(v) => set("proc.depth", v)} fmt={(v)=>v.toFixed(2)} />
+          )}
+          {cfg.proc.shape === "flower" && (
+            <Slider label="Лепестков" desc="Количество лепестков цветка." value={cfg.proc.petals} min={3} max={12} step={1} onChange={(v) => set("proc.petals", v)} />
+          )}
+          {(cfg.proc.shape === "ring" || cfg.proc.shape === "crescent") && (
+            <Slider label={cfg.proc.shape === "ring" ? "Дырка" : "Серп"} desc={cfg.proc.shape === "ring" ? "Размер внутреннего отверстия кольца." : "Насколько узок серп месяца."} value={cfg.proc.hole} min={0.1} max={0.9} step={0.05} onChange={(v) => set("proc.hole", v)} fmt={(v)=>v.toFixed(2)} />
+          )}
         </Section>
 
         <Section title="Цвета">
@@ -1356,6 +2009,63 @@ export default function App() {
             ))}
           </div>
         </Section>
+
+        <Section title="Поведение (режимы)">
+          <p className="text-[10px] text-neutral-500 leading-relaxed mb-2">
+            Включаемые модели движения. Можно комбинировать.
+          </p>
+
+          <Toggle label="Стайность (boids)" on={cfg.behaviors.flock.on} onChange={(v) => set("behaviors.flock.on", v)}>
+            <Slider label="Выравнивание" desc="Насколько рыбка подстраивает скорость под соседей. Больше = согласованные потоки." value={cfg.behaviors.flock.align} min={0} max={1} step={0.05} onChange={(v) => set("behaviors.flock.align", v)} fmt={(v)=>v.toFixed(2)} />
+            <Slider label="Сплочение" desc="Притяжение к центру локальной группы. Больше = плотные косяки." value={cfg.behaviors.flock.cohesion} min={0} max={1} step={0.05} onChange={(v) => set("behaviors.flock.cohesion", v)} fmt={(v)=>v.toFixed(2)} />
+            <Slider label="Радиус стаи" desc="Дистанция, на которой рыбки считаются соседями по стае." value={cfg.behaviors.flock.radius} min={20} max={160} step={5} onChange={(v) => set("behaviors.flock.radius", v)} fmt={(v)=>`${v}px`} />
+          </Toggle>
+
+          <Toggle label="Течение вдоль края" on={cfg.behaviors.swirl.on} onChange={(v) => set("behaviors.swirl.on", v)}>
+            <Slider label="Сила / направление" desc="Касательное течение у поверхности силуэта. Знак = направление вращения." value={cfg.behaviors.swirl.strength} min={-1} max={1} step={0.05} onChange={(v) => set("behaviors.swirl.strength", v)} fmt={(v)=>v.toFixed(2)} />
+          </Toggle>
+
+          <Toggle label="Блуждание" on={cfg.behaviors.wander.on} onChange={(v) => set("behaviors.wander.on", v)}>
+            <Slider label="Сила" desc="Медленный дрейф собственного курса — рыбки меандрируют, а не летят по прямой." value={cfg.behaviors.wander.strength} min={0} max={1} step={0.05} onChange={(v) => set("behaviors.wander.strength", v)} fmt={(v)=>v.toFixed(2)} />
+          </Toggle>
+
+          <Toggle label="Масса от размера" on={cfg.behaviors.mass.on} onChange={(v) => set("behaviors.mass.on", v)}>
+            <Slider label="Сила" desc="Крупные рыбки инертнее (вялый разгон, ниже предел скорости), мелкие — юркие." value={cfg.behaviors.mass.strength} min={0} max={1} step={0.05} onChange={(v) => set("behaviors.mass.strength", v)} fmt={(v)=>v.toFixed(2)} />
+          </Toggle>
+
+          <Toggle label="Гравитация / стекание" on={cfg.behaviors.gravity.on} onChange={(v) => set("behaviors.gravity.on", v)}>
+            <Slider label="Сила" desc="Постоянный снос. Рой стекает и собирается у основания силуэта." value={cfg.behaviors.gravity.strength} min={0} max={600} step={10} onChange={(v) => set("behaviors.gravity.strength", v)} />
+            <Slider label="Направление" desc="Угол сноса в градусах. 90° = вниз, 0° = вправо, 270° = вверх." value={cfg.behaviors.gravity.angle} min={0} max={360} step={5} onChange={(v) => set("behaviors.gravity.angle", v)} fmt={(v)=>`${v}°`} />
+          </Toggle>
+
+          <Toggle label="Сброс давления" on={cfg.behaviors.density.on} onChange={(v) => set("behaviors.density.on", v)}>
+            <Slider label="Сила" desc="В перенаселённых зонах рыбки толкаются наружу — фронт «дышит», не каменеет." value={cfg.behaviors.density.strength} min={0} max={1} step={0.05} onChange={(v) => set("behaviors.density.strength", v)} fmt={(v)=>v.toFixed(2)} />
+            <Slider label="Порог соседей" desc="Со скольких соседей включается расталкивание." value={cfg.behaviors.density.count} min={2} max={15} step={1} onChange={(v) => set("behaviors.density.count", v)} />
+          </Toggle>
+
+          <Toggle label="Хищник (курсор)" on={cfg.behaviors.predator.on} onChange={(v) => set("behaviors.predator.on", v)}>
+            <p className="text-[10px] text-neutral-500 leading-relaxed mb-1">Рыбки разбегаются от курсора, пока он над холстом.</p>
+            <Slider label="Радиус паники" desc="На каком расстоянии от курсора рыбки начинают бежать." value={cfg.behaviors.predator.radius} min={30} max={320} step={10} onChange={(v) => set("behaviors.predator.radius", v)} fmt={(v)=>`${v}px`} />
+            <Slider label="Сила бегства" desc="Как резко рыбки удирают от курсора." value={cfg.behaviors.predator.force} min={100} max={2000} step={50} onChange={(v) => set("behaviors.predator.force", v)} />
+          </Toggle>
+
+          <Toggle label="След за объектом" on={cfg.behaviors.wake.on} onChange={(v) => set("behaviors.wake.on", v)}>
+            <Slider label="Сила" desc="Вихревой кильватер за движущимся силуэтом. Видно при перетаскивании объекта." value={cfg.behaviors.wake.strength} min={0} max={3} step={0.1} onChange={(v) => set("behaviors.wake.strength", v)} fmt={(v)=>v.toFixed(1)} />
+          </Toggle>
+
+          <Toggle label="Температура" on={cfg.behaviors.temp.on} onChange={(v) => set("behaviors.temp.on", v)}>
+            <Slider label="Ажитация" desc="Непрерывное случайное дрожание роя. Больше = рой «кипит»." value={cfg.behaviors.temp.strength} min={0} max={1} step={0.05} onChange={(v) => set("behaviors.temp.strength", v)} fmt={(v)=>v.toFixed(2)} />
+          </Toggle>
+
+          <Toggle label="Мембрана (мягкое тело)" on={cfg.behaviors.membrane.on} onChange={(v) => set("behaviors.membrane.on", v)}>
+            <Slider label="Жёсткость" desc="Сила пружин между соседями. Рой держится как тянущаяся плёнка." value={cfg.behaviors.membrane.stiffness} min={0} max={1} step={0.05} onChange={(v) => set("behaviors.membrane.stiffness", v)} fmt={(v)=>v.toFixed(2)} />
+            <Slider label="Радиус связей" desc="До какой дистанции соседи связаны пружинами." value={cfg.behaviors.membrane.radius} min={30} max={140} step={5} onChange={(v) => set("behaviors.membrane.radius", v)} fmt={(v)=>`${v}px`} />
+          </Toggle>
+
+          <Toggle label="Прилипание к краю" on={cfg.behaviors.adhere.on} onChange={(v) => set("behaviors.adhere.on", v)}>
+            <Slider label="Сила" desc="Рыбки приклеиваются к поверхности силуэта, образуя ползущий слой." value={cfg.behaviors.adhere.strength} min={0} max={1} step={0.05} onChange={(v) => set("behaviors.adhere.strength", v)} fmt={(v)=>v.toFixed(2)} />
+          </Toggle>
+        </Section>
       </div>
 
       {/* сцена */}
@@ -1374,7 +2084,7 @@ export default function App() {
           onMouseDown={onDown}
           onMouseMove={onMove}
           onMouseUp={onUp}
-          onMouseLeave={onUp}
+          onMouseLeave={() => { onUp(); if (simRef.current) simRef.current.pointer.inside = false; }}
           className="rounded-lg shadow-2xl cursor-crosshair max-w-full max-h-[80vh] border border-neutral-700"
           style={{ touchAction: "none", cursor: mode === "erase" ? "cell" : mode === "move" ? "grab" : mode === "push" ? "move" : "crosshair" }}
         />
@@ -1464,6 +2174,19 @@ export default function App() {
 
       {/* правая панель — физика / симуляция */}
       <div className="w-72 bg-neutral-900 border-l border-neutral-800 overflow-y-auto shrink-0">
+        <Section title="⚡ Производительность">
+          <div className="flex gap-1">
+            {([["quality","Качество"],["auto","Авто"],["speed","Скорость"]]).map(([m, lbl]) => (
+              <button key={m} onClick={() => set("perf.mode", m)}
+                className={`text-[10px] px-2 py-1.5 rounded flex-1 ${cfg.perf.mode === m ? "bg-amber-500 text-black" : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"}`}
+              >{lbl}</button>
+            ))}
+          </div>
+          <p className="text-[10px] text-neutral-500 leading-relaxed mt-2">
+            «Скорость» строит сетку коллизий и решает границу 1 раз за кадр (вместо ×проходов) и чуть снижает число проходов — заметный прирост FPS при большом числе частиц ценой лёгкой рыхлости фронта. «Авто» включает это при &gt;1400 частиц.
+          </p>
+        </Section>
+
         <Section title="Холст">
           <Slider label="Ширина" desc="Ширина холста в пикселях. Объект автоматически центрируется." value={cfg.canvas.w} min={320} max={2560} step={10} onChange={(v) => { set("canvas.w", v); if (simRef.current) simRef.current.obj.x = v / 2; }} />
           <Slider label="Высота" desc="Высота холста в пикселях. Объект автоматически центрируется." value={cfg.canvas.h} min={320} max={2560} step={10} onChange={(v) => { set("canvas.h", v); if (simRef.current) simRef.current.obj.y = v / 2; }} />
